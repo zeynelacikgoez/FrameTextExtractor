@@ -184,7 +184,7 @@ def process_video_optimized(
     frame_interval: float = 1.0,  # Time interval in seconds
     scale_factor: int = 2,
     motion_threshold: float = 0.05,
-    max_workers: Optional[int] = None,  # New option to limit workers
+    max_workers: Optional[int] = 4,  # Set default to 4
     supported_formats: Optional[List[str]] = None,  # Extend supported formats
     adaptive_threshold: bool = False  # Option to use adaptive thresholding
 ) -> List[Tuple[int, str]]:
@@ -252,7 +252,7 @@ def process_video_optimized(
                     if thresh_frame is not None and gray_frame is not None:
                         if prev_gray is None or detect_movement(prev_gray, gray_frame, motion_threshold):
                             frames_to_process.append((frame_num, thresh_frame))
-                            logging.debug(f"Frame {frame_num} added für OCR-Verarbeitung.")
+                            logging.debug(f"Frame {frame_num} hinzugefügt für OCR-Verarbeitung.")
                         prev_gray = gray_frame
 
                 frame_num += 1
@@ -260,7 +260,7 @@ def process_video_optimized(
             logging.info(f"Alle relevanten Frames ({len(frames_to_process)}) gesammelt für OCR-Verarbeitung.")
 
             results = []
-            with ThreadPoolExecutor(max_workers=max_workers or os.cpu_count()) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_frame = {executor.submit(process_frame, thresh): frame_num
                                    for frame_num, thresh in frames_to_process}
                 logging.info("Starte OCR-Verarbeitung mit ThreadPoolExecutor.")
@@ -298,16 +298,16 @@ def extract_output_content(text: str) -> str:
     Extracts the content inside the <output> tags from the given text.
 
     :param text: The full text to be analyzed.
-    :return: Content inside the <output> tags or the full text if no tags are found.
+    :return: Concatenated content inside the <output> tags or the full text if no tags are found.
     """
     # Robust extraction of <output> tags
-    match = re.search(r'<output>(.*?)</output>', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
+    matches = re.findall(r'<output>(.*?)</output>', text, re.DOTALL | re.IGNORECASE)
+    if matches:
+        # Mehrere Blöcke zusammenfassen
+        return "\n".join(m.strip() for m in matches)
     else:
-        # Try to return the full text if no tags were found
+        # Versuch, den vollständigen Text zu verwenden
         logging.warning("Keine <output>-Tags in der LLM-Antwort gefunden. Versuch, den vollständigen Text zu verwenden.")
-        # Additional parsing logic can be added here, e.g., sentence or paragraph formation
         return text.strip()
 
 @retry_on_exception(max_retries=3, delay=2, exceptions=(openai.error.RateLimitError, openai.error.OpenAIError,))
@@ -349,17 +349,43 @@ def correct_text_with_llm(text: str, api_key: str) -> str:
         logging.error(f"Unerwarteter Fehler während der LLM-Korrektur: {e}")
         raise  # Re-raises the exception
 
-def process_and_correct_text(video_path: str, api_key: str, max_tokens: int = 7000) -> str:
+def process_and_correct_text(
+    video_path: str,
+    api_key: str,
+    max_tokens: int = 7000,
+    tesseract_path: Optional[str] = None,
+    frame_interval: float = 1.0,
+    scale_factor: int = 2,
+    motion_threshold: float = 0.05,
+    max_workers: Optional[int] = 4,
+    supported_formats: Optional[List[str]] = None,
+    adaptive_threshold: bool = False
+) -> str:
     """
     Processes the video, extracts and corrects the text.
 
     :param video_path: Path to the video file.
     :param api_key: API key for the DeepSeek API.
     :param max_tokens: Maximum number of tokens per text chunk (including buffer).
+    :param tesseract_path: Custom path to Tesseract-OCR executable.
+    :param frame_interval: Time interval in seconds for selecting frames.
+    :param scale_factor: Factor to reduce the size of the frames.
+    :param motion_threshold: Threshold for motion detection.
+    :param max_workers: Maximum number of workers for parallel processing.
+    :param supported_formats: List of supported video formats.
+    :param adaptive_threshold: Whether to use adaptive thresholding.
     :return: Final corrected text.
     """
-    set_tesseract_path(tesseract_path=args.tesseract_path)  # Korrigierte Übergabe des Arguments
-    extracted_text = process_video_optimized(video_path)
+    set_tesseract_path(tesseract_path=tesseract_path)  # Korrigierte Übergabe des Arguments
+    extracted_text = process_video_optimized(
+        video_path=video_path,
+        frame_interval=frame_interval,
+        scale_factor=scale_factor,
+        motion_threshold=motion_threshold,
+        max_workers=max_workers,
+        supported_formats=supported_formats,
+        adaptive_threshold=adaptive_threshold
+    )
 
     if not extracted_text:
         logging.warning("Kein Text extrahiert. Der korrigierte Text wird leer sein.")
@@ -367,30 +393,27 @@ def process_and_correct_text(video_path: str, api_key: str, max_tokens: int = 70
 
     corrected_chunks = []
     current_chunk = ""
-    # Ensure correct model is used with tiktoken
-    try:
-        encoding = tiktoken.encoding_for_model("deepseek-chat")  # Adjust for the model used
-    except KeyError:
-        logging.error("Das Modell 'deepseek-chat' ist in tiktoken nicht verfügbar.")
-        sys.exit(1)
 
     logging.info("Starte Textkorrektur mit LLM.")
 
     with ThreadPoolExecutor(max_workers=4) as executor:  # Begrenzung der max_workers auf 4
         futures = []
         for frame_num, text in extracted_text:
-            # Token estimation including buffer
-            token_count = estimate_tokens(current_chunk + " " + text) + 500
-            if token_count > max_tokens:
-                if current_chunk.strip():
-                    futures.append(executor.submit(correct_text_with_llm, current_chunk.strip(), api_key))
-                    logging.debug("Text-Chunk zur Korrektur eingereicht.")
-                current_chunk = text  # Start a new chunk with the current text
-            else:
-                if current_chunk:
-                    current_chunk += " " + text
+            sentences = re.split(r'(?<=[.!?])\s+', text)  # Satzbasierte Trennung
+            for sentence in sentences:
+                if not sentence:
+                    continue
+                token_count = estimate_tokens(current_chunk + " " + sentence) + 500
+                if token_count > max_tokens:
+                    if current_chunk.strip():
+                        futures.append(executor.submit(correct_text_with_llm, current_chunk.strip(), api_key))
+                        logging.debug("Text-Chunk zur Korrektur eingereicht.")
+                    current_chunk = sentence  # Start a new chunk mit dem aktuellen Satz
                 else:
-                    current_chunk = text
+                    if current_chunk:
+                        current_chunk += " " + sentence
+                    else:
+                        current_chunk = sentence
 
         if current_chunk.strip():
             futures.append(executor.submit(correct_text_with_llm, current_chunk.strip(), api_key))
@@ -474,7 +497,7 @@ def main():
     parser.add_argument('--frame-interval', type=float, default=1.0, help='Zeitintervall in Sekunden zur Auswahl der Frames')
     parser.add_argument('--scale-factor', type=int, default=2, help='Faktor zur Reduzierung der Größe der Frames')
     parser.add_argument('--motion-threshold', type=float, default=0.05, help='Schwellenwert für die Bewegungserkennung')
-    parser.add_argument('--max-workers', type=int, default=None, help='Maximale Anzahl von Arbeitern für die parallele Verarbeitung')
+    parser.add_argument('--max-workers', type=int, default=4, help='Maximale Anzahl von Arbeitern für die parallele Verarbeitung')  # Standard auf 4 gesetzt
     parser.add_argument('--supported-formats', type=str, nargs='*', default=['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm'], help='Liste der unterstützten Videoformate')
     parser.add_argument('--max-tokens', type=int, default=7000, help='Maximale Anzahl von Tokens pro Text-Chunk (inklusive Puffer)')
     parser.add_argument('--tesseract-path', type=str, default=None, help='Benutzerdefinierter Pfad zur Tesseract-OCR ausführbaren Datei')
@@ -494,7 +517,14 @@ def main():
         final_text = process_and_correct_text(
             video_path=args.video_path,
             api_key=api_key,
-            max_tokens=args.max_tokens
+            max_tokens=args.max_tokens,
+            tesseract_path=args.tesseract_path,
+            frame_interval=args.frame_interval,
+            scale_factor=args.scale_factor,
+            motion_threshold=args.motion_threshold,
+            max_workers=args.max_workers,
+            supported_formats=args.supported_formats,
+            adaptive_threshold=args.adaptive_threshold
         )
 
         with open(args.output_text_path, 'w', encoding='utf-8') as f:
